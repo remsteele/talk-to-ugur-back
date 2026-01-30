@@ -35,19 +35,33 @@ type Reply struct {
 type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	Refusal string `json:"refusal,omitempty"`
 }
 
 type chatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
-	Temperature float64       `json:"temperature,omitempty"`
-	Stream      bool          `json:"stream"`
+	Model          string         `json:"model"`
+	Messages       []chatMessage  `json:"messages"`
+	Temperature    float64        `json:"temperature,omitempty"`
+	Stream         bool           `json:"stream"`
+	ResponseFormat responseFormat `json:"response_format,omitempty"`
 }
 
 type chatResponse struct {
 	Choices []struct {
 		Message chatMessage `json:"message"`
 	} `json:"choices"`
+}
+
+type responseFormat struct {
+	Type       string      `json:"type"`
+	JsonSchema *jsonSchema `json:"json_schema,omitempty"`
+}
+
+type jsonSchema struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Schema      map[string]any `json:"schema"`
+	Strict      bool           `json:"strict"`
 }
 
 type aiJSON struct {
@@ -57,10 +71,10 @@ type aiJSON struct {
 
 func NewClient(cfg *config.Config) *Client {
 	return &Client{
-		baseURL:      strings.TrimRight(cfg.DeepSeekBaseURL, "/"),
-		apiKey:       cfg.DeepSeekAPIKey,
-		model:        cfg.DeepSeekModel,
-		temperature:  cfg.DeepSeekTemperature,
+		baseURL:      strings.TrimRight(cfg.OpenAIBaseURL, "/"),
+		apiKey:       cfg.OpenAIAPIKey,
+		model:        cfg.OpenAIModel,
+		temperature:  cfg.OpenAITemperature,
 		systemPrompt: cfg.AISystemPrompt,
 		promptPath:   cfg.AISystemPromptPath,
 		emotions:     cfg.AIEmotions,
@@ -93,51 +107,46 @@ func (c *Client) GenerateReply(ctx context.Context, history []db.ChatMessage) (R
 	}
 
 	reqBody := chatRequest{
-		Model:       c.model,
-		Messages:    messages,
-		Temperature: c.temperature,
-		Stream:      false,
+		Model:          c.model,
+		Messages:       messages,
+		Temperature:    c.temperature,
+		Stream:         false,
+		ResponseFormat: c.buildStructuredFormat(),
 	}
 
-	payload, err := json.Marshal(reqBody)
+	parsed, err := c.doChatRequest(ctx, reqBody)
 	if err != nil {
-		return Reply{}, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(payload))
-	if err != nil {
-		return Reply{}, err
-	}
-	if c.apiKey == "" {
-		return Reply{}, errors.New("missing DEEPSEEK_API_KEY")
-	}
-
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return Reply{}, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return Reply{}, fmt.Errorf("deepseek api error: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var parsed chatResponse
-	if err = json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		return Reply{}, err
+		if apiErr := (*apiError)(nil); errors.As(err, &apiErr) && shouldRetryWithoutTemperature(apiErr.status, apiErr.body) {
+			reqBody.Temperature = 0
+			parsed, err = c.doChatRequest(ctx, reqBody)
+		}
+		if err != nil {
+			if apiErr := (*apiError)(nil); errors.As(err, &apiErr) && shouldFallbackToJSONMode(apiErr.status, apiErr.body) {
+				reqBody.ResponseFormat = responseFormat{Type: "json_object"}
+				parsed, err = c.doChatRequest(ctx, reqBody)
+			}
+		}
+		if err != nil {
+			if apiErr := (*apiError)(nil); errors.As(err, &apiErr) && shouldRetryWithoutTemperature(apiErr.status, apiErr.body) && reqBody.Temperature != 0 {
+				reqBody.Temperature = 0
+				parsed, err = c.doChatRequest(ctx, reqBody)
+			}
+		}
+		if err != nil {
+			return Reply{}, err
+		}
 	}
 
 	if len(parsed.Choices) == 0 {
-		return Reply{}, errors.New("deepseek api returned no choices")
+		return Reply{}, errors.New("openai api returned no choices")
 	}
 
 	content := strings.TrimSpace(parsed.Choices[0].Message.Content)
 	if content == "" {
-		return Reply{}, errors.New("deepseek api returned empty content")
+		if strings.TrimSpace(parsed.Choices[0].Message.Refusal) != "" {
+			return Reply{}, errors.New("openai api refused to answer")
+		}
+		return Reply{}, errors.New("openai api returned empty content")
 	}
 
 	aiPayload, ok := parseAIJSON(content)
@@ -157,6 +166,105 @@ func (c *Client) GenerateReply(ctx context.Context, history []db.ChatMessage) (R
 		Text:    strings.TrimSpace(aiPayload.Reply),
 		Emotion: emotion,
 	}, nil
+}
+
+type apiError struct {
+	status int
+	body   string
+}
+
+func (e *apiError) Error() string {
+	return fmt.Sprintf("openai api error: status=%d body=%s", e.status, e.body)
+}
+
+func (c *Client) doChatRequest(ctx context.Context, reqBody chatRequest) (chatResponse, error) {
+	if c.apiKey == "" {
+		return chatResponse{}, errors.New("missing OPENAI_API_KEY")
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return chatResponse{}, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(payload))
+	if err != nil {
+		return chatResponse{}, err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return chatResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return chatResponse{}, &apiError{status: resp.StatusCode, body: strings.TrimSpace(string(body))}
+	}
+
+	var parsed chatResponse
+	if err = json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return chatResponse{}, err
+	}
+	return parsed, nil
+}
+
+func (c *Client) buildStructuredFormat() responseFormat {
+	schema := map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"properties": map[string]any{
+			"reply": map[string]any{
+				"type": "string",
+			},
+			"emotion": c.buildEmotionSchema(),
+		},
+		"required": []string{"reply", "emotion"},
+	}
+
+	return responseFormat{
+		Type: "json_schema",
+		JsonSchema: &jsonSchema{
+			Name:        "chat_reply",
+			Description: "Structured response for chat reply and emotion.",
+			Schema:      schema,
+			Strict:      true,
+		},
+	}
+}
+
+func (c *Client) buildEmotionSchema() map[string]any {
+	prop := map[string]any{
+		"type": "string",
+	}
+	if len(c.emotions) > 0 {
+		prop["enum"] = c.emotions
+	}
+	return prop
+}
+
+func shouldFallbackToJSONMode(status int, body string) bool {
+	if status != http.StatusBadRequest {
+		return false
+	}
+	lowered := strings.ToLower(body)
+	return strings.Contains(lowered, "response_format") ||
+		strings.Contains(lowered, "json_schema") ||
+		strings.Contains(lowered, "structured outputs") ||
+		strings.Contains(lowered, "not supported")
+}
+
+func shouldRetryWithoutTemperature(status int, body string) bool {
+	if status != http.StatusBadRequest {
+		return false
+	}
+	lowered := strings.ToLower(body)
+	return strings.Contains(lowered, "temperature") &&
+		(strings.Contains(lowered, "unsupported") || strings.Contains(lowered, "unsupported_value"))
 }
 
 func parseAIJSON(content string) (aiJSON, bool) {

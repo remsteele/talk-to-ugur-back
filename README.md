@@ -1,10 +1,10 @@
 # talk-to-ugur-back
 
-Go backend so you too can talk to Ugur. Stores visitors, chat threads, and messages in Postgres via sqlc and calls DeepSeek for replies.
+Go backend so you too can talk to Ugur. Stores visitors, chat threads, and messages in Postgres via sqlc and calls OpenAI for replies.
 
 ## Project layout
 
-- `ai/` — DeepSeek client and JSON reply parsing
+- `ai/` — OpenAI client and JSON reply parsing
 - `assets/emotions/` — emotion images (served at `/emotions/...`)
 - `prompts/system.txt` — editable system prompt (loaded on each request)
 - `models/` — migrations + sqlc queries + generated code
@@ -23,8 +23,16 @@ cp .env.example .env
 2. Fill in at least:
 
 ```
-DEEPSEEK_API_KEY=your_key_here
+OPENAI_API_KEY=your_key_here
 POSTGRES_CONN_STR=postgres://postgres:postgres@localhost:5433/talk_to_ugur?sslmode=disable
+```
+
+Optional OpenAI overrides:
+
+```
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_TEMPERATURE=0.7
 ```
 
 ## Prompts
@@ -160,21 +168,37 @@ Response:
 
 Returns the stored messages for a thread.
 
-## DeepSeek request format
+## OpenAI request format (structured output)
 
-Requests follow the DeepSeek chat completions API, for example:
+Requests follow the OpenAI chat completions API with JSON schema output, for example:
 
 ```
-POST https://api.deepseek.com/chat/completions
-Authorization: Bearer ${DEEPSEEK_API_KEY}
+POST https://api.openai.com/v1/chat/completions
+Authorization: Bearer ${OPENAI_API_KEY}
 Content-Type: application/json
 
 {
-  "model": "deepseek-chat",
+  "model": "gpt-4o-mini",
   "messages": [
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "Hello!"}
   ],
-  "stream": false
+  "stream": false,
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "chat_reply",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "reply": { "type": "string" },
+          "emotion": { "type": "string", "enum": ["neutral", "happy"] }
+        },
+        "required": ["reply", "emotion"]
+      }
+    }
+  }
 }
 ```

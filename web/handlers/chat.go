@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -144,6 +145,7 @@ func (h *ChatHandler) HandleSendMessage(c *gin.Context) {
 	aiReply, err := h.ai.GenerateReply(ctx, history)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "ai request failed"})
+		log.Printf("ai error: %v", err)
 		return
 	}
 
