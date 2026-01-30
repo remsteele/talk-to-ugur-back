@@ -1,0 +1,29 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: talk_to_ugur
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+  api:
+    build: .
+    env_file:
+      - .env
+    environment:
+      POSTGRES_CONN_STR: postgres://postgres:postgres@db:5432/talk_to_ugur?sslmode=disable
+      HTTP_LISTEN_ADDR: :8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+    volumes:
+      - ./prompts:/app/prompts
+      - ./assets:/app/assets
+
+volumes:
+  db-data:
