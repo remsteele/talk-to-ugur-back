@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -52,6 +53,14 @@ type chatResponse struct {
 	} `json:"choices"`
 }
 
+type chatStreamResponse struct {
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content"`
+			Refusal string `json:"refusal,omitempty"`
+		} `json:"delta"`
+	} `json:"choices"`
+}
 type responseFormat struct {
 	Type       string      `json:"type"`
 	JsonSchema *jsonSchema `json:"json_schema,omitempty"`
@@ -168,6 +177,114 @@ func (c *Client) GenerateReply(ctx context.Context, history []db.ChatMessage) (R
 	}, nil
 }
 
+func (c *Client) StreamReply(ctx context.Context, history []db.ChatMessage, onChunk func(string) error) (Reply, error) {
+	messages := make([]chatMessage, 0, len(history)+1)
+
+	emotionList := strings.Join(c.emotions, ", ")
+	formatInstruction := fmt.Sprintf("Respond ONLY with valid JSON and no extra text. The JSON must have keys 'reply' and 'emotion'. 'emotion' must be one of: %s.", emotionList)
+	systemPrompt := strings.TrimSpace(c.systemPrompt)
+	if prompt := c.loadPromptFromFile(); prompt != "" {
+		systemPrompt = prompt
+	}
+	messages = append(messages, chatMessage{
+		Role:    "system",
+		Content: strings.TrimSpace(systemPrompt + "\n\n" + formatInstruction),
+	})
+
+	for _, msg := range history {
+		role := msg.Role
+		switch role {
+		case "user", "assistant":
+			messages = append(messages, chatMessage{Role: role, Content: msg.Content})
+		}
+	}
+
+	reqBody := chatRequest{
+		Model:          c.model,
+		Messages:       messages,
+		Temperature:    c.temperature,
+		Stream:         true,
+		ResponseFormat: c.buildStructuredFormat(),
+	}
+
+	body, err := c.doChatStreamRequestWithFallback(ctx, reqBody)
+	if err != nil {
+		return Reply{}, err
+	}
+	defer body.Close()
+
+	reader := bufio.NewReader(body)
+	var contentBuilder strings.Builder
+	var refusalBuilder strings.Builder
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return Reply{}, err
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk chatStreamResponse
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+
+		for _, choice := range chunk.Choices {
+			if choice.Delta.Content != "" {
+				contentBuilder.WriteString(choice.Delta.Content)
+				if onChunk != nil {
+					if err := onChunk(choice.Delta.Content); err != nil {
+						return Reply{}, err
+					}
+				}
+			}
+			if choice.Delta.Refusal != "" {
+				refusalBuilder.WriteString(choice.Delta.Refusal)
+			}
+		}
+	}
+
+	content := strings.TrimSpace(contentBuilder.String())
+	if content == "" {
+		if strings.TrimSpace(refusalBuilder.String()) != "" {
+			return Reply{}, errors.New("openai api refused to answer")
+		}
+		return Reply{}, errors.New("openai api returned empty content")
+	}
+
+	aiPayload, ok := parseAIJSON(content)
+	if !ok || aiPayload.Reply == "" {
+		return Reply{
+			Text:    content,
+			Emotion: fallbackEmotion(c.emotions),
+		}, nil
+	}
+
+	emotion := normalizeEmotion(aiPayload.Emotion, c.emotions)
+	if emotion == "" {
+		emotion = fallbackEmotion(c.emotions)
+	}
+
+	return Reply{
+		Text:    strings.TrimSpace(aiPayload.Reply),
+		Emotion: emotion,
+	}, nil
+}
+
 type apiError struct {
 	status int
 	body   string
@@ -211,6 +328,64 @@ func (c *Client) doChatRequest(ctx context.Context, reqBody chatRequest) (chatRe
 		return chatResponse{}, err
 	}
 	return parsed, nil
+}
+
+func (c *Client) doChatStreamRequestWithFallback(ctx context.Context, reqBody chatRequest) (io.ReadCloser, error) {
+	body, err := c.doChatStreamRequest(ctx, reqBody)
+	if err != nil {
+		if apiErr := (*apiError)(nil); errors.As(err, &apiErr) && shouldRetryWithoutTemperature(apiErr.status, apiErr.body) {
+			reqBody.Temperature = 0
+			body, err = c.doChatStreamRequest(ctx, reqBody)
+		}
+		if err != nil {
+			if apiErr := (*apiError)(nil); errors.As(err, &apiErr) && shouldFallbackToJSONMode(apiErr.status, apiErr.body) {
+				reqBody.ResponseFormat = responseFormat{Type: "json_object"}
+				body, err = c.doChatStreamRequest(ctx, reqBody)
+			}
+		}
+		if err != nil {
+			if apiErr := (*apiError)(nil); errors.As(err, &apiErr) && shouldRetryWithoutTemperature(apiErr.status, apiErr.body) && reqBody.Temperature != 0 {
+				reqBody.Temperature = 0
+				body, err = c.doChatStreamRequest(ctx, reqBody)
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return body, nil
+}
+
+func (c *Client) doChatStreamRequest(ctx context.Context, reqBody chatRequest) (io.ReadCloser, error) {
+	if c.apiKey == "" {
+		return nil, errors.New("missing OPENAI_API_KEY")
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return nil, &apiError{status: resp.StatusCode, body: strings.TrimSpace(string(body))}
+	}
+
+	return resp.Body, nil
 }
 
 func (c *Client) buildStructuredFormat() responseFormat {

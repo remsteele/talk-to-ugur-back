@@ -74,82 +74,24 @@ func (h *ChatHandler) HandleSendMessage(c *gin.Context) {
 		return
 	}
 
-	ctx := c.Request.Context()
-	var threadUUID uuid.UUID
-	var visitorUUID uuid.UUID
-	if req.ThreadID == "" {
-		var err error
-		visitorUUID, err = h.resolveVisitor(ctx, c, req.VisitorID)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				c.JSON(http.StatusNotFound, gin.H{"error": "visitor not found"})
-				return
-			}
-			if errors.Is(err, errInvalidVisitorID) {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid visitor_id"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create visitor"})
-			return
-		}
-		threadUUID = uuid.New()
-		_, err = h.queries.CreateChatThread(ctx, db.CreateChatThreadParams{
-			Uuid:        pgUUID(threadUUID),
-			VisitorUuid: pgUUID(visitorUUID),
-		})
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create thread"})
-			return
-		}
-	} else {
-		var err error
-		threadUUID, err = uuid.Parse(req.ThreadID)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid thread_id"})
-			return
-		}
-		thread, err := h.queries.GetChatThread(ctx, pgUUID(threadUUID))
-		if err != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "thread not found"})
-			return
-		}
-		if thread.VisitorUuid.Valid {
-			h.touchVisitor(ctx, thread.VisitorUuid, c)
-			visitorUUID = uuid.UUID(thread.VisitorUuid.Bytes)
-		}
-	}
-
-	userMsg, err := h.queries.CreateChatMessage(ctx, db.CreateChatMessageParams{
-		Uuid:       pgUUID(uuid.New()),
-		ThreadUuid: pgUUID(threadUUID),
-		Role:       "user",
-		Content:    message,
-		Emotion:    pgtype.Text{},
-	})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store message"})
+	threadUUID, visitorUUID, userMsg, history, ok := h.prepareChat(c, req, message)
+	if !ok {
 		return
 	}
 
-	history, err := h.queries.GetChatMessagesByThreadLimit(ctx, db.GetChatMessagesByThreadLimitParams{
-		ThreadUuid: pgUUID(threadUUID),
-		Limit:      int32(h.maxHistoryLimit()),
-	})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load history"})
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamChat(c, threadUUID, visitorUUID, userMsg, history)
 		return
 	}
 
-	reverseMessages(history)
-
-	aiReply, err := h.ai.GenerateReply(ctx, history)
+	aiReply, err := h.ai.GenerateReply(c.Request.Context(), history)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "ai request failed"})
 		log.Printf("ai error: %v", err)
 		return
 	}
 
-	assistantMsg, err := h.queries.CreateChatMessage(ctx, db.CreateChatMessageParams{
+	assistantMsg, err := h.queries.CreateChatMessage(c.Request.Context(), db.CreateChatMessageParams{
 		Uuid:       pgUUID(uuid.New()),
 		ThreadUuid: pgUUID(threadUUID),
 		Role:       "assistant",
@@ -315,6 +257,157 @@ func uuidOrEmpty(id uuid.UUID) string {
 func setVisitorCookie(c *gin.Context, visitorID string) {
 	const maxAgeSeconds = 60 * 60 * 24 * 30
 	c.SetCookie("visitor_id", visitorID, maxAgeSeconds, "/", "", false, false)
+}
+
+func (h *ChatHandler) prepareChat(c *gin.Context, req sendMessageRequest, message string) (uuid.UUID, uuid.UUID, db.ChatMessage, []db.ChatMessage, bool) {
+	ctx := c.Request.Context()
+	var threadUUID uuid.UUID
+	var visitorUUID uuid.UUID
+	if req.ThreadID == "" {
+		var err error
+		visitorUUID, err = h.resolveVisitor(ctx, c, req.VisitorID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "visitor not found"})
+				return uuid.UUID{}, uuid.UUID{}, db.ChatMessage{}, nil, false
+			}
+			if errors.Is(err, errInvalidVisitorID) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid visitor_id"})
+				return uuid.UUID{}, uuid.UUID{}, db.ChatMessage{}, nil, false
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create visitor"})
+			return uuid.UUID{}, uuid.UUID{}, db.ChatMessage{}, nil, false
+		}
+		threadUUID = uuid.New()
+		_, err = h.queries.CreateChatThread(ctx, db.CreateChatThreadParams{
+			Uuid:        pgUUID(threadUUID),
+			VisitorUuid: pgUUID(visitorUUID),
+		})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create thread"})
+			return uuid.UUID{}, uuid.UUID{}, db.ChatMessage{}, nil, false
+		}
+	} else {
+		var err error
+		threadUUID, err = uuid.Parse(req.ThreadID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid thread_id"})
+			return uuid.UUID{}, uuid.UUID{}, db.ChatMessage{}, nil, false
+		}
+		thread, err := h.queries.GetChatThread(ctx, pgUUID(threadUUID))
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "thread not found"})
+			return uuid.UUID{}, uuid.UUID{}, db.ChatMessage{}, nil, false
+		}
+		if thread.VisitorUuid.Valid {
+			h.touchVisitor(ctx, thread.VisitorUuid, c)
+			visitorUUID = uuid.UUID(thread.VisitorUuid.Bytes)
+		}
+	}
+
+	userMsg, err := h.queries.CreateChatMessage(ctx, db.CreateChatMessageParams{
+		Uuid:       pgUUID(uuid.New()),
+		ThreadUuid: pgUUID(threadUUID),
+		Role:       "user",
+		Content:    message,
+		Emotion:    pgtype.Text{},
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store message"})
+		return uuid.UUID{}, uuid.UUID{}, db.ChatMessage{}, nil, false
+	}
+
+	history, err := h.queries.GetChatMessagesByThreadLimit(ctx, db.GetChatMessagesByThreadLimitParams{
+		ThreadUuid: pgUUID(threadUUID),
+		Limit:      int32(h.maxHistoryLimit()),
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load history"})
+		return uuid.UUID{}, uuid.UUID{}, db.ChatMessage{}, nil, false
+	}
+
+	reverseMessages(history)
+
+	return threadUUID, visitorUUID, userMsg, history, true
+}
+
+func (h *ChatHandler) streamChat(c *gin.Context, threadUUID uuid.UUID, visitorUUID uuid.UUID, userMsg db.ChatMessage, history []db.ChatMessage) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+
+	visitorID := uuidOrEmpty(visitorUUID)
+	if visitorID != "" {
+		setVisitorCookie(c, visitorID)
+		c.Header("X-Visitor-Id", visitorID)
+	}
+
+	meta := gin.H{
+		"visitor_id":   visitorID,
+		"thread_id":    threadUUID.String(),
+		"user_message": toMessageResponse(userMsg),
+	}
+	if err := writeSSE(c, "meta", meta); err != nil {
+		log.Printf("sse meta error: %v", err)
+		return
+	}
+
+	var collected strings.Builder
+	aiReply, err := h.ai.StreamReply(c.Request.Context(), history, func(chunk string) error {
+		collected.WriteString(chunk)
+		return writeSSEData(c, "token", chunk)
+	})
+	if err != nil {
+		log.Printf("ai stream error: %v", err)
+		_ = writeSSEData(c, "error", "ai request failed")
+		return
+	}
+
+	assistantMsg, err := h.queries.CreateChatMessage(c.Request.Context(), db.CreateChatMessageParams{
+		Uuid:       pgUUID(uuid.New()),
+		ThreadUuid: pgUUID(threadUUID),
+		Role:       "assistant",
+		Content:    aiReply.Text,
+		Emotion:    pgText(aiReply.Emotion),
+	})
+	if err != nil {
+		log.Printf("ai store error: %v", err)
+		_ = writeSSEData(c, "error", "failed to store assistant message")
+		return
+	}
+
+	donePayload := gin.H{
+		"assistant_message": toMessageResponse(assistantMsg),
+	}
+	_ = writeSSE(c, "done", donePayload)
+}
+
+func writeSSE(c *gin.Context, event string, payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return writeSSEData(c, event, string(data))
+}
+
+func writeSSEData(c *gin.Context, event, data string) error {
+	if event != "" {
+		if _, err := c.Writer.Write([]byte("event: " + event + "\n")); err != nil {
+			return err
+		}
+	}
+	for _, line := range strings.Split(data, "\n") {
+		if _, err := c.Writer.Write([]byte("data: " + line + "\n")); err != nil {
+			return err
+		}
+	}
+	if _, err := c.Writer.Write([]byte("\n")); err != nil {
+		return err
+	}
+	if flusher, ok := c.Writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return nil
 }
 
 func (h *ChatHandler) resolveVisitor(ctx context.Context, c *gin.Context, visitorID string) (uuid.UUID, error) {
