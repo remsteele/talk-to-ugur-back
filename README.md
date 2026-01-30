@@ -1,13 +1,13 @@
 # talk-to-ugur-back
 
-Go backend so you too can talk to Ugur. Stores visitors, chat threads, and messages in Postgres via sqlc and calls OpenAI for replies.
+Go backend so you can talk to Ugur. Stores visitors, chat threads, and messages in Postgres via sqlc and uses OpenAI for replies. 
 
 ## Project layout
 
-- `ai/` — OpenAI client and JSON reply parsing
-- `assets/emotions/` — emotion images (served at `/emotions/...`)
-- `prompts/system.txt` — editable system prompt (loaded on each request)
+- `ai/` — OpenAI client + structured output handling
+- `config/` — env config
 - `models/` — migrations + sqlc queries + generated code
+- `prompts/` — system prompt file (hot‑loaded)
 - `web/` — HTTP server + handlers
 
 ## Environment setup
@@ -20,7 +20,13 @@ This app loads `.env` automatically at startup.
 cp .env.example .env
 ```
 
-2. Fill in at least:
+2. Copy the prompt template:
+
+```
+cp prompts/system.txt.example prompts/system.txt
+```
+
+3. Fill in at least:
 
 ```
 OPENAI_API_KEY=your_key_here
@@ -38,7 +44,7 @@ OPENAI_TEMPERATURE=0.7
 ## Prompts
 
 - Default prompt file: `prompts/system.txt`
-- You can edit this file without restarting the server (it is read on each request).
+- You can edit it without restarting the server (read on each request).
 - If the file is missing, `AI_SYSTEM_PROMPT` from the environment is used.
 
 Config:
@@ -48,20 +54,31 @@ AI_SYSTEM_PROMPT_PATH=./prompts/system.txt
 AI_SYSTEM_PROMPT=...fallback text...
 ```
 
-## Emotions + images
+## Emotions (no images)
 
-- The AI returns an `emotion` string from `AI_EMOTIONS`.
-- Put your emotion images in `assets/emotions/` with filenames matching the emotion names you want to use, for example:
+- The AI returns an `emotion` **string** chosen from `AI_EMOTIONS`.
+- The frontend should map that string to whatever UI you want (emoji, badge, CSS class, etc.).
+
+Example:
 
 ```
-assets/emotions/neutral.png
-assets/emotions/happy.png
-assets/emotions/angry.png
+AI_EMOTIONS=neutral,happy,sad,angry,confused,amused,thoughtful,excited
 ```
 
-- Static files are served at:
-  - `GET /emotions/<filename>` (ex: `/emotions/angry.png`)
-  - `GET /assets/...` (full assets directory)
+## Rate limiting / abuse protection
+
+Requests are rate limited per IP address to reduce abuse.
+
+Configure in `.env`:
+
+```
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_REQUESTS=60
+RATE_LIMIT_WINDOW_SECONDS=60
+RATE_LIMIT_BURST=10
+RATE_LIMIT_MAX_STRIKES=5
+RATE_LIMIT_BLOCK_SECONDS=600
+```
 
 ## Running locally (no Docker)
 
@@ -89,28 +106,12 @@ docker compose build
 docker compose up
 ```
 
-Compose mounts `./prompts` and `./assets` into the container so you can update prompts and images without rebuilding.
 The Postgres container is exposed on host port `5433` (so it won't clash with a local Postgres on `5432`).
 
 Host connection string:
 
 ```
 postgres://postgres:postgres@localhost:5433/talk_to_ugur?sslmode=disable
-```
-
-## Rate limiting / abuse protection
-
-Requests are rate limited per IP address to reduce abuse.
-
-Configure in `.env`:
-
-```
-RATE_LIMIT_ENABLED=true
-RATE_LIMIT_REQUESTS=60
-RATE_LIMIT_WINDOW_SECONDS=60
-RATE_LIMIT_BURST=10
-RATE_LIMIT_MAX_STRIKES=5
-RATE_LIMIT_BLOCK_SECONDS=600
 ```
 
 ## API
@@ -164,13 +165,28 @@ Response:
 }
 ```
 
+#### Streaming
+
+Add `?stream=true` to stream the assistant response via SSE:
+
+```
+POST /api/v1/chat/messages?stream=true
+```
+
+SSE event types:
+
+- `meta` (JSON) — includes `visitor_id`, `thread_id`, `user_message`, and `emotion`
+- `token` (text) — reply text chunks only
+- `done` (JSON) — includes `assistant_message`
+- `error` (text) — error string
+
 ### `GET /api/v1/chat/threads/:thread_id/messages?limit=100`
 
 Returns the stored messages for a thread.
 
 ## OpenAI request format (structured output)
 
-Requests follow the OpenAI chat completions API with JSON schema output, for example:
+Requests use the OpenAI chat completions API with JSON schema output:
 
 ```
 POST https://api.openai.com/v1/chat/completions
@@ -194,7 +210,7 @@ Content-Type: application/json
         "additionalProperties": false,
         "properties": {
           "reply": { "type": "string" },
-          "emotion": { "type": "string", "enum": ["neutral", "happy"] }
+          "emotion": { "type": "string" }
         },
         "required": ["reply", "emotion"]
       }
