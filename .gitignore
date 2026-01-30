@@ -5,3 +5,4 @@ bin/
 
 # editor
 .DS_Store
+.idea
