@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"talk-to-ugur-back/web/handlers"
+	"talk-to-ugur-back/web/middleware"
 )
 
 func (s *Server) makeRoutes() *gin.Engine {
@@ -41,6 +42,7 @@ func (s *Server) makeRoutes() *gin.Engine {
 	})
 
 	apiV1 := eng.Group("/api/v1")
+	apiV1.Use(middleware.RateLimitMiddleware(s.limiter))
 	chatHandlers := handlers.NewChatHandler(s.dbQueries, s.aiClient, s.cfg)
 	chatGroup := apiV1.Group("/chat")
 	apiV1.POST("/visitors", chatHandlers.HandleCreateVisitor)
@@ -59,6 +61,10 @@ func (s *Server) getCorsMiddleware() gin.HandlerFunc {
 		"Content-Type",
 		"User-Agent",
 		"x-requested-with",
+		"X-Visitor-Id",
+	}
+	cfg.ExposeHeaders = []string{
+		"X-Visitor-Id",
 	}
 	return cors.New(cfg)
 }

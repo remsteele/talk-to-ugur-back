@@ -13,6 +13,7 @@ import (
 	"talk-to-ugur-back/config"
 	"talk-to-ugur-back/models"
 	"talk-to-ugur-back/models/db"
+	"talk-to-ugur-back/web/middleware"
 )
 
 type Server struct {
@@ -20,6 +21,7 @@ type Server struct {
 	pgPool    *pgxpool.Pool
 	cfg       *config.Config
 	aiClient  *ai.Client
+	limiter   *middleware.RateLimiter
 	startTime time.Time
 	ready     atomic.Bool
 }
@@ -62,12 +64,14 @@ func NewServer(ctx context.Context) (*Server, error) {
 
 	queries := db.New(pgPool)
 	aiClient := ai.NewClient(cfg)
+	limiter := middleware.NewRateLimiter(cfg)
 
 	server := &Server{
 		dbQueries: queries,
 		pgPool:    pgPool,
 		cfg:       cfg,
 		aiClient:  aiClient,
+		limiter:   limiter,
 		startTime: time.Now(),
 	}
 	return server, nil

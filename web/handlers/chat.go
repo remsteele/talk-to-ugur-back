@@ -165,6 +165,10 @@ func (h *ChatHandler) HandleSendMessage(c *gin.Context) {
 		UserMessage:      toMessageResponse(userMsg),
 		AssistantMessage: toMessageResponse(assistantMsg),
 	}
+	if resp.VisitorID != "" {
+		setVisitorCookie(c, resp.VisitorID)
+		c.Header("X-Visitor-Id", resp.VisitorID)
+	}
 
 	c.JSON(http.StatusOK, resp)
 }
@@ -176,6 +180,8 @@ func (h *ChatHandler) HandleCreateVisitor(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create visitor"})
 		return
 	}
+	setVisitorCookie(c, visitorUUID.String())
+	c.Header("X-Visitor-Id", visitorUUID.String())
 	c.JSON(http.StatusOK, createVisitorResponse{
 		VisitorID: visitorUUID.String(),
 	})
@@ -302,6 +308,11 @@ func uuidOrEmpty(id uuid.UUID) string {
 		return ""
 	}
 	return id.String()
+}
+
+func setVisitorCookie(c *gin.Context, visitorID string) {
+	const maxAgeSeconds = 60 * 60 * 24 * 30
+	c.SetCookie("visitor_id", visitorID, maxAgeSeconds, "/", "", false, false)
 }
 
 func (h *ChatHandler) resolveVisitor(ctx context.Context, c *gin.Context, visitorID string) (uuid.UUID, error) {

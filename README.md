@@ -24,7 +24,7 @@ cp .env.example .env
 
 ```
 DEEPSEEK_API_KEY=your_key_here
-POSTGRES_CONN_STR=postgres://postgres:postgres@localhost:5432/talk_to_ugur?sslmode=disable
+POSTGRES_CONN_STR=postgres://postgres:postgres@localhost:5433/talk_to_ugur?sslmode=disable
 ```
 
 ## Prompts
@@ -90,6 +90,21 @@ Host connection string:
 postgres://postgres:postgres@localhost:5433/talk_to_ugur?sslmode=disable
 ```
 
+## Rate limiting / abuse protection
+
+Requests are rate limited per IP address to reduce abuse.
+
+Configure in `.env`:
+
+```
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_REQUESTS=60
+RATE_LIMIT_WINDOW_SECONDS=60
+RATE_LIMIT_BURST=10
+RATE_LIMIT_MAX_STRIKES=5
+RATE_LIMIT_BLOCK_SECONDS=600
+```
+
 ## API
 
 ### `POST /api/v1/visitors`
@@ -101,6 +116,13 @@ Response:
   "visitor_id": "uuid"
 }
 ```
+
+Store this `visitor_id` on the client and send it back on future requests:
+
+- Header: `X-Visitor-Id: <uuid>` (recommended), or
+- JSON body field: `visitor_id`
+
+The server also sets a `visitor_id` cookie and an `X-Visitor-Id` response header for convenience.
 
 ### `POST /api/v1/chat/messages`
 
