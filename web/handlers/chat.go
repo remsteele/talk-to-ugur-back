@@ -342,25 +342,60 @@ func (h *ChatHandler) streamChat(c *gin.Context, threadUUID uuid.UUID, visitorUU
 		c.Header("X-Visitor-Id", visitorID)
 	}
 
-	meta := gin.H{
-		"visitor_id":   visitorID,
-		"thread_id":    threadUUID.String(),
-		"user_message": toMessageResponse(userMsg),
-	}
-	if err := writeSSE(c, "meta", meta); err != nil {
-		log.Printf("sse meta error: %v", err)
-		return
+	metaSent := false
+	var buffered strings.Builder
+	sendMeta := func(emotion string) error {
+		meta := gin.H{
+			"visitor_id":   visitorID,
+			"thread_id":    threadUUID.String(),
+			"user_message": toMessageResponse(userMsg),
+			"emotion":      emotion,
+		}
+		return writeSSE(c, "meta", meta)
 	}
 
-	var collected strings.Builder
+	onEmotion := func(emotion string) error {
+		if emotion == "" || metaSent {
+			return nil
+		}
+		if err := sendMeta(emotion); err != nil {
+			return err
+		}
+		metaSent = true
+		if buffered.Len() > 0 {
+			if err := writeSSEData(c, "token", buffered.String()); err != nil {
+				return err
+			}
+			buffered.Reset()
+		}
+		return nil
+	}
+
 	aiReply, err := h.ai.StreamReply(c.Request.Context(), history, func(chunk string) error {
-		collected.WriteString(chunk)
+		if !metaSent {
+			buffered.WriteString(chunk)
+			return nil
+		}
 		return writeSSEData(c, "token", chunk)
-	})
+	}, onEmotion)
 	if err != nil {
 		log.Printf("ai stream error: %v", err)
 		_ = writeSSEData(c, "error", "ai request failed")
 		return
+	}
+	if !metaSent {
+		if err := sendMeta(aiReply.Emotion); err != nil {
+			log.Printf("sse meta error: %v", err)
+			return
+		}
+		metaSent = true
+		if buffered.Len() > 0 {
+			if err := writeSSEData(c, "token", buffered.String()); err != nil {
+				log.Printf("sse token error: %v", err)
+				return
+			}
+			buffered.Reset()
+		}
 	}
 
 	assistantMsg, err := h.queries.CreateChatMessage(c.Request.Context(), db.CreateChatMessageParams{

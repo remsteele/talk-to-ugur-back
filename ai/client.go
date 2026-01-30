@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -97,7 +98,7 @@ func (c *Client) GenerateReply(ctx context.Context, history []db.ChatMessage) (R
 	messages := make([]chatMessage, 0, len(history)+1)
 
 	emotionList := strings.Join(c.emotions, ", ")
-	formatInstruction := fmt.Sprintf("Respond ONLY with valid JSON and no extra text. The JSON must have keys 'reply' and 'emotion'. 'emotion' must be one of: %s.", emotionList)
+	formatInstruction := fmt.Sprintf("Respond ONLY with valid JSON and no extra text. The JSON must have keys 'emotion' and 'reply' in that order. 'emotion' must be one of: %s.", emotionList)
 	systemPrompt := strings.TrimSpace(c.systemPrompt)
 	if prompt := c.loadPromptFromFile(); prompt != "" {
 		systemPrompt = prompt
@@ -177,11 +178,11 @@ func (c *Client) GenerateReply(ctx context.Context, history []db.ChatMessage) (R
 	}, nil
 }
 
-func (c *Client) StreamReply(ctx context.Context, history []db.ChatMessage, onChunk func(string) error) (Reply, error) {
+func (c *Client) StreamReply(ctx context.Context, history []db.ChatMessage, onChunk func(string) error, onEmotion func(string) error) (Reply, error) {
 	messages := make([]chatMessage, 0, len(history)+1)
 
 	emotionList := strings.Join(c.emotions, ", ")
-	formatInstruction := fmt.Sprintf("Respond ONLY with valid JSON and no extra text. The JSON must have keys 'reply' and 'emotion'. 'emotion' must be one of: %s.", emotionList)
+	formatInstruction := fmt.Sprintf("Respond ONLY with valid JSON and no extra text. The JSON must have keys 'emotion' and 'reply' in that order. 'emotion' must be one of: %s.", emotionList)
 	systemPrompt := strings.TrimSpace(c.systemPrompt)
 	if prompt := c.loadPromptFromFile(); prompt != "" {
 		systemPrompt = prompt
@@ -214,8 +215,9 @@ func (c *Client) StreamReply(ctx context.Context, history []db.ChatMessage, onCh
 	defer body.Close()
 
 	reader := bufio.NewReader(body)
-	var contentBuilder strings.Builder
 	var refusalBuilder strings.Builder
+	var rawBuilder strings.Builder
+	parser := newJSONStreamParser(onChunk, onEmotion)
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -245,11 +247,9 @@ func (c *Client) StreamReply(ctx context.Context, history []db.ChatMessage, onCh
 
 		for _, choice := range chunk.Choices {
 			if choice.Delta.Content != "" {
-				contentBuilder.WriteString(choice.Delta.Content)
-				if onChunk != nil {
-					if err := onChunk(choice.Delta.Content); err != nil {
-						return Reply{}, err
-					}
+				rawBuilder.WriteString(choice.Delta.Content)
+				if err := parser.Feed(choice.Delta.Content); err != nil {
+					return Reply{}, err
 				}
 			}
 			if choice.Delta.Refusal != "" {
@@ -258,7 +258,18 @@ func (c *Client) StreamReply(ctx context.Context, history []db.ChatMessage, onCh
 		}
 	}
 
-	content := strings.TrimSpace(contentBuilder.String())
+	content := strings.TrimSpace(parser.Reply())
+	if content == "" {
+		rawContent := strings.TrimSpace(rawBuilder.String())
+		if rawContent != "" {
+			if parsed, ok := parseAIJSON(rawContent); ok && parsed.Reply != "" {
+				content = strings.TrimSpace(parsed.Reply)
+				if parser.Emotion() == "" {
+					parser.SetEmotion(parsed.Emotion)
+				}
+			}
+		}
+	}
 	if content == "" {
 		if strings.TrimSpace(refusalBuilder.String()) != "" {
 			return Reply{}, errors.New("openai api refused to answer")
@@ -266,21 +277,13 @@ func (c *Client) StreamReply(ctx context.Context, history []db.ChatMessage, onCh
 		return Reply{}, errors.New("openai api returned empty content")
 	}
 
-	aiPayload, ok := parseAIJSON(content)
-	if !ok || aiPayload.Reply == "" {
-		return Reply{
-			Text:    content,
-			Emotion: fallbackEmotion(c.emotions),
-		}, nil
-	}
-
-	emotion := normalizeEmotion(aiPayload.Emotion, c.emotions)
+	emotion := normalizeEmotion(parser.Emotion(), c.emotions)
 	if emotion == "" {
 		emotion = fallbackEmotion(c.emotions)
 	}
 
 	return Reply{
-		Text:    strings.TrimSpace(aiPayload.Reply),
+		Text:    strings.TrimSpace(content),
 		Emotion: emotion,
 	}, nil
 }
@@ -440,6 +443,192 @@ func shouldRetryWithoutTemperature(status int, body string) bool {
 	lowered := strings.ToLower(body)
 	return strings.Contains(lowered, "temperature") &&
 		(strings.Contains(lowered, "unsupported") || strings.Contains(lowered, "unsupported_value"))
+}
+
+type jsonStreamParser struct {
+	onReply        func(string) error
+	onEmotion      func(string) error
+	replyBuilder   strings.Builder
+	replyChunk     strings.Builder
+	currentKey     strings.Builder
+	currentValue   strings.Builder
+	currentKeyName string
+	emotion        string
+	inString       bool
+	expectValue    bool
+	mode           string // "key" or "value"
+	escape         bool
+	unicodeLeft    int
+	unicodeBuf     strings.Builder
+}
+
+func newJSONStreamParser(onReply func(string) error, onEmotion func(string) error) *jsonStreamParser {
+	return &jsonStreamParser{
+		onReply:   onReply,
+		onEmotion: onEmotion,
+	}
+}
+
+func (p *jsonStreamParser) Feed(text string) error {
+	for _, r := range text {
+		if p.unicodeLeft > 0 {
+			p.unicodeBuf.WriteRune(r)
+			p.unicodeLeft--
+			if p.unicodeLeft == 0 {
+				decoded, ok := decodeUnicode(p.unicodeBuf.String())
+				p.unicodeBuf.Reset()
+				if ok {
+					if err := p.handleRune(decoded); err != nil {
+						return err
+					}
+				}
+			}
+			continue
+		}
+
+		if p.inString {
+			if p.escape {
+				p.escape = false
+				switch r {
+				case '"', '\\', '/':
+					if err := p.handleRune(r); err != nil {
+						return err
+					}
+				case 'b':
+					if err := p.handleRune('\b'); err != nil {
+						return err
+					}
+				case 'f':
+					if err := p.handleRune('\f'); err != nil {
+						return err
+					}
+				case 'n':
+					if err := p.handleRune('\n'); err != nil {
+						return err
+					}
+				case 'r':
+					if err := p.handleRune('\r'); err != nil {
+						return err
+					}
+				case 't':
+					if err := p.handleRune('\t'); err != nil {
+						return err
+					}
+				case 'u':
+					p.unicodeLeft = 4
+				default:
+					if err := p.handleRune(r); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+
+			if r == '\\' {
+				p.escape = true
+				continue
+			}
+			if r == '"' {
+				p.inString = false
+				if p.mode == "key" {
+					p.currentKeyName = p.currentKey.String()
+					p.currentKey.Reset()
+					p.expectValue = true
+				} else if p.mode == "value" {
+					if p.currentKeyName == "emotion" && p.emotion == "" {
+						p.emotion = p.currentValue.String()
+						if p.onEmotion != nil {
+							if err := p.onEmotion(p.emotion); err != nil {
+								return err
+							}
+						}
+					}
+					p.currentValue.Reset()
+					p.expectValue = false
+				}
+				p.mode = ""
+				continue
+			}
+			if err := p.handleRune(r); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch r {
+		case '"':
+			p.inString = true
+			if p.expectValue {
+				p.mode = "value"
+			} else {
+				p.mode = "key"
+			}
+		case ':':
+		case ',':
+			p.expectValue = false
+			p.mode = ""
+		case '{', '}', ' ', '\n', '\r', '\t':
+			continue
+		}
+	}
+
+	if p.replyChunk.Len() > 0 {
+		if p.onReply != nil {
+			if err := p.onReply(p.replyChunk.String()); err != nil {
+				return err
+			}
+		}
+		p.replyChunk.Reset()
+	}
+
+	return nil
+}
+
+func (p *jsonStreamParser) handleRune(r rune) error {
+	if p.mode == "key" {
+		p.currentKey.WriteRune(r)
+		return nil
+	}
+	if p.mode == "value" {
+		if p.currentKeyName == "reply" {
+			p.replyBuilder.WriteRune(r)
+			p.replyChunk.WriteRune(r)
+			return nil
+		}
+		if p.currentKeyName == "emotion" && p.emotion == "" {
+			p.currentValue.WriteRune(r)
+		}
+	}
+	return nil
+}
+
+func (p *jsonStreamParser) Reply() string {
+	return p.replyBuilder.String()
+}
+
+func (p *jsonStreamParser) Emotion() string {
+	return p.emotion
+}
+
+func (p *jsonStreamParser) SetEmotion(emotion string) {
+	if p.emotion != "" {
+		return
+	}
+	p.emotion = emotion
+	if p.onEmotion != nil && emotion != "" {
+		_ = p.onEmotion(emotion)
+	}
+}
+
+func decodeUnicode(hexStr string) (rune, bool) {
+	if len(hexStr) != 4 {
+		return 0, false
+	}
+	val, err := strconv.ParseInt(hexStr, 16, 32)
+	if err != nil {
+		return 0, false
+	}
+	return rune(val), true
 }
 
 func parseAIJSON(content string) (aiJSON, bool) {
